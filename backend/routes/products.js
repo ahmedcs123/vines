@@ -1,10 +1,24 @@
 import express from 'express';
-import pool from '../db/connection.js';
+import { db, saveDatabase } from '../db/connection.js';
 
 const router = express.Router();
 
+// Helper function to convert sql.js result to objects
+function resultToObjects(result) {
+    if (!result || result.length === 0) return [];
+    const rows = [];
+    for (const values of result[0].values) {
+        const obj = {};
+        result[0].columns.forEach((col, idx) => {
+            obj[col] = values[idx];
+        });
+        rows.push(obj);
+    }
+    return rows;
+}
+
 // GET all products with filters
-router.get('/', async (req, res) => {
+router.get('/', (req, res) => {
     try {
         const { category, search } = req.query;
 
@@ -15,30 +29,38 @@ router.get('/', async (req, res) => {
       WHERE 1=1
     `;
         const params = [];
-        let paramCount = 1;
 
         // Filter by category slug
         if (category) {
-            query += ` AND c.slug = $${paramCount}`;
+            query += ` AND c.slug = ?`;
             params.push(category);
-            paramCount++;
         }
 
         // Search by name or code
         if (search) {
             query += ` AND (
-        LOWER(p.name_en) LIKE LOWER($${paramCount}) OR 
-        LOWER(p.name_ar) LIKE LOWER($${paramCount}) OR 
-        LOWER(p.code) LIKE LOWER($${paramCount})
+        LOWER(p.name_en) LIKE LOWER(?) OR 
+        LOWER(p.name_ar) LIKE LOWER(?) OR 
+        LOWER(p.code) LIKE LOWER(?)
       )`;
-            params.push(`%${search}%`);
-            paramCount++;
+            const searchTerm = `%${search}%`;
+            params.push(searchTerm, searchTerm, searchTerm);
         }
 
         query += ' ORDER BY p.created_at DESC';
 
-        const result = await pool.query(query, params);
-        res.json(result.rows);
+        const stmt = db.prepare(query);
+        if (params.length > 0) {
+            stmt.bind(params);
+        }
+
+        const rows = [];
+        while (stmt.step()) {
+            rows.push(stmt.getAsObject());
+        }
+        stmt.free();
+
+        res.json(rows);
     } catch (error) {
         console.error('Error fetching products:', error);
         res.status(500).json({ error: 'Failed to fetch products' });
@@ -46,22 +68,25 @@ router.get('/', async (req, res) => {
 });
 
 // GET single product by ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', (req, res) => {
     try {
         const { id } = req.params;
-        const result = await pool.query(
-            `SELECT p.*, c.name_en as category_name_en, c.name_ar as category_name_ar, c.slug as category_slug
-       FROM products p
-       JOIN categories c ON p.category_id = c.id
-       WHERE p.id = $1`,
-            [id]
-        );
+        const stmt = db.prepare(`
+            SELECT p.*, c.name_en as category_name_en, c.name_ar as category_name_ar, c.slug as category_slug
+            FROM products p
+            JOIN categories c ON p.category_id = c.id
+            WHERE p.id = ?
+        `);
+        stmt.bind([id]);
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Product not found' });
+        if (stmt.step()) {
+            const row = stmt.getAsObject();
+            stmt.free();
+            res.json(row);
+        } else {
+            stmt.free();
+            res.status(404).json({ error: 'Product not found' });
         }
-
-        res.json(result.rows[0]);
     } catch (error) {
         console.error('Error fetching product:', error);
         res.status(500).json({ error: 'Failed to fetch product' });
@@ -69,7 +94,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // POST create new product (Admin)
-router.post('/', async (req, res) => {
+router.post('/', (req, res) => {
     try {
         const {
             category_id,
@@ -82,32 +107,43 @@ router.post('/', async (req, res) => {
             image
         } = req.body;
 
-        const result = await pool.query(
-            `INSERT INTO products 
-       (category_id, name_en, name_ar, code, weight, description_en, description_ar, image) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
-       RETURNING *`,
-            [
-                category_id,
-                name_en,
-                name_ar,
-                code,
-                weight,
-                description_en || '',
-                description_ar || '',
-                image || 'placeholder.jpg'
-            ]
-        );
+        const stmt = db.prepare(`
+            INSERT INTO products 
+            (category_id, name_en, name_ar, code, weight, description_en, description_ar, image) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
 
-        res.status(201).json(result.rows[0]);
+        stmt.bind([
+            category_id,
+            name_en,
+            name_ar,
+            code,
+            weight,
+            description_en || '',
+            description_ar || '',
+            image || 'placeholder.jpg'
+        ]);
+
+        stmt.step();
+        stmt.free();
+
+        saveDatabase();
+
+        // Get the inserted product
+        const stmt2 = db.prepare('SELECT * FROM products WHERE id = last_insert_rowid()');
+        stmt2.step();
+        const row = stmt2.getAsObject();
+        stmt2.free();
+
+        res.status(201).json(row);
     } catch (error) {
         console.error('Error creating product:', error);
-        res.status(500).json({ error: 'Failed to create product' });
+        res.status(500).json({ error: 'Failed to create product', details: error.message });
     }
 });
 
 // PUT update product (Admin)
-router.put('/:id', async (req, res) => {
+router.put('/:id', (req, res) => {
     try {
         const { id } = req.params;
         const {
@@ -121,20 +157,42 @@ router.put('/:id', async (req, res) => {
             image
         } = req.body;
 
-        const result = await pool.query(
-            `UPDATE products 
-       SET category_id = $1, name_en = $2, name_ar = $3, code = $4, 
-           weight = $5, description_en = $6, description_ar = $7, image = $8
-       WHERE id = $9 
-       RETURNING *`,
-            [category_id, name_en, name_ar, code, weight, description_en, description_ar, image, id]
-        );
+        const stmt = db.prepare(`
+            UPDATE products 
+            SET category_id = ?, name_en = ?, name_ar = ?, code = ?, 
+                weight = ?, description_en = ?, description_ar = ?, image = ?
+            WHERE id = ?
+        `);
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Product not found' });
+        stmt.bind([
+            category_id,
+            name_en,
+            name_ar,
+            code,
+            weight,
+            description_en,
+            description_ar,
+            image,
+            id
+        ]);
+
+        stmt.step();
+        stmt.free();
+
+        saveDatabase();
+
+        // Get the updated product
+        const stmt2 = db.prepare('SELECT * FROM products WHERE id = ?');
+        stmt2.bind([id]);
+
+        if (stmt2.step()) {
+            const row = stmt2.getAsObject();
+            stmt2.free();
+            res.json(row);
+        } else {
+            stmt2.free();
+            res.status(404).json({ error: 'Product not found' });
         }
-
-        res.json(result.rows[0]);
     } catch (error) {
         console.error('Error updating product:', error);
         res.status(500).json({ error: 'Failed to update product' });
@@ -142,18 +200,16 @@ router.put('/:id', async (req, res) => {
 });
 
 // DELETE product (Admin)
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', (req, res) => {
     try {
         const { id } = req.params;
 
-        const result = await pool.query(
-            'DELETE FROM products WHERE id = $1 RETURNING *',
-            [id]
-        );
+        const stmt = db.prepare('DELETE FROM products WHERE id = ?');
+        stmt.bind([id]);
+        stmt.step();
+        stmt.free();
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Product not found' });
-        }
+        saveDatabase();
 
         res.json({ message: 'Product deleted successfully' });
     } catch (error) {

@@ -1,4 +1,4 @@
-import pool from '../db/connection.js';
+import { db, saveDatabase } from '../db/connection.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -54,75 +54,70 @@ const products = [
     { category: 6, name_en: 'Slush Syrup', name_ar: 'سيروب سلاش', code: 'BV-503', weight: '5 KG' }
 ];
 
-async function seedDatabase() {
-    const client = await pool.connect();
-
+function seedDatabase() {
     try {
         console.log('🌱 Starting database seeding...');
 
-        await client.query('BEGIN');
+        // Read and execute schema
+        const schemaPath = path.join(__dirname, '../db/schema.sql');
+        const schema = fs.readFileSync(schemaPath, 'utf8');
+
+        // Execute schema (create tables)
+        db.exec(schema);
+        console.log('📋 Schema executed successfully');
 
         // Clear existing data
         console.log('🗑️  Clearing existing data...');
-        await client.query('DELETE FROM products');
-        await client.query('DELETE FROM categories');
-        await client.query('ALTER SEQUENCE categories_id_seq RESTART WITH 1');
-        await client.query('ALTER SEQUENCE products_id_seq RESTART WITH 1');
+        db.run('DELETE FROM products');
+        db.run('DELETE FROM categories');
 
         // Insert categories
         console.log('📁 Inserting categories...');
-        const categoryIds = [];
         for (const cat of categories) {
-            const result = await client.query(
-                'INSERT INTO categories (name_en, name_ar, slug) VALUES ($1, $2, $3) RETURNING id',
-                [cat.name_en, cat.name_ar, cat.slug]
+            db.run(
+                'INSERT INTO categories (name_en, name_ar, slug) VALUES ($1, $2, $3)',
+                { $1: cat.name_en, $2: cat.name_ar, $3: cat.slug }
             );
-            categoryIds.push(result.rows[0].id);
             console.log(`   ✓ ${cat.name_en} (${cat.name_ar})`);
         }
 
         // Insert products
         console.log('📦 Inserting products...');
         for (const product of products) {
-            await client.query(
-                `INSERT INTO products 
-         (category_id, name_en, name_ar, code, weight, description_en, description_ar) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                [
-                    product.category,
-                    product.name_en,
-                    product.name_ar,
-                    product.code,
-                    product.weight,
-                    `Premium quality ${product.name_en.toLowerCase()} for professional use.`,
-                    `${product.name_ar} بجودة عالية للاستخدام المهني.`
-                ]
-            );
+            db.run(`
+                INSERT INTO products 
+                (category_id, name_en, name_ar, code, weight, description_en, description_ar) 
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `, {
+                $1: product.category,
+                $2: product.name_en,
+                $3: product.name_ar,
+                $4: product.code,
+                $5: product.weight,
+                $6: `Premium quality ${product.name_en.toLowerCase()} for professional use.`,
+                $7: `${product.name_ar} بجودة عالية للاستخدام المهني.`
+            });
             console.log(`   ✓ ${product.code}: ${product.name_en}`);
         }
 
-        await client.query('COMMIT');
+        // Save database
+        saveDatabase();
 
         console.log('✅ Database seeding completed successfully!');
         console.log(`📊 Inserted: ${categories.length} categories, ${products.length} products`);
 
     } catch (error) {
-        await client.query('ROLLBACK');
         console.error('❌ Error seeding database:', error);
         throw error;
-    } finally {
-        client.release();
-        await pool.end();
     }
 }
 
 // Run the seed function
-seedDatabase()
-    .then(() => {
-        console.log('🎉 Seeding process finished');
-        process.exit(0);
-    })
-    .catch((error) => {
-        console.error('💥 Seeding failed:', error);
-        process.exit(1);
-    });
+try {
+    seedDatabase();
+    console.log('🎉 Seeding process finished');
+    process.exit(0);
+} catch (error) {
+    console.error('💥 Seeding failed:', error);
+    process.exit(1);
+}
