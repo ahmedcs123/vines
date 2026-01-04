@@ -1,4 +1,4 @@
-{
+module.exports = {
     "apps": [{
         "name": "vines-backend",
         "script": "./server.js",
